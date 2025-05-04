@@ -85,3 +85,47 @@ void A_timerinterrupt(void) {
         }
     }
 }
+/* B 端状态变量 */
+static int expectedseqnum;
+static bool receive_ack[WINDOWSIZE];
+static packet receive_buffer[WINDOWSIZE];
+
+/* 初始化 B */
+void B_init(void) {
+    expectedseqnum = 0;
+    for (int i = 0; i < WINDOWSIZE; i++) {
+        receive_ack[i] = false;
+    }
+}
+
+/* 接收到数据包 */
+void B_input(packet rcvd) {
+    if (!IsCorrupted(&rcvd)) {
+        int pos = (rcvd.seqnum - expectedseqnum + SEQSPACE) % SEQSPACE;
+        if (pos < WINDOWSIZE && !receive_ack[pos]) {
+            /* 缓存包 */
+            receive_ack[pos]    = true;
+            receive_buffer[pos] = rcvd;
+        }
+        /* 按序交付 */
+        while (receive_ack[0]) {
+            tolayer5(BEntity, receive_buffer[0].payload);
+            for (int i = 0; i < WINDOWSIZE - 1; i++) {
+                receive_buffer[i] = receive_buffer[i+1];
+                receive_ack[i]    = receive_ack[i+1];
+            }
+            receive_ack[WINDOWSIZE-1] = false;
+            expectedseqnum = (expectedseqnum + 1) % SEQSPACE;
+        }
+    }
+    /* 发送 ACK */
+    packet ackpkt;
+    ackpkt.seqnum  = NOTINUSE;
+    ackpkt.acknum  = (expectedseqnum - 1 + SEQSPACE) % SEQSPACE;
+    ackpkt.checksum = ComputeChecksum(&ackpkt);
+    tolayer3(BEntity, ackpkt);
+}
+
+/* 简单保留空壳，备用 */
+void B_timerinterrupt(void)    {}
+void B_output(message msg)     {}
