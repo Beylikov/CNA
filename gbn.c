@@ -1,258 +1,275 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdbool.h>
 #include "emulator.h"
 #include "gbn.h"
 
-/* 参数定义 */
-#define RTT        16.0
-#define WINDOWSIZE 6
-#define SEQSPACE   12
-#define NOTINUSE   (-1)
+/* ******************************************************************
+   Go Back N protocol.  Adapted from J.F.Kurose
+   ALTERNATING BIT AND GO-BACK-N NETWORK EMULATOR: VERSION 1.2
 
-/* A 端接口（空壳） */
-void A_init(void)              {}
-void A_output(message msg)     {}
-void A_input(packet pkt)       {}
-void A_timerinterrupt(void)    {}
+   Network properties:
+   - one way network delay averages five time units (longer if there
+   are other messages in the channel for GBN), but can be larger
+   - packets can be corrupted (either the header or the data portion)
+   or lost, according to user-defined probabilities
+   - packets will be delivered in the order in which they were sent
+   (although some can be lost).
 
-/* B 端接口（空壳） */
-void B_init(void)              {}
-void B_input(packet pkt)       {}
-void B_output(message msg)     {}
-void B_timerinterrupt(void)    {}
-/* 计算并返回 pkt 的校验和 */
-unsigned short ComputeChecksum(packet *pkt) {
-    unsigned long sum = 0;
-    unsigned short *data = (unsigned short *)pkt;
-    for (int i = 0; i < sizeof(packet)/2; i++) {
-        sum += data[i];
-        if (sum & 0xFFFF0000) {
-            sum = (sum & 0xFFFF) + (sum >> 16);
+   Modifications:
+   - removed bidirectional GBN code and other code not used by prac.
+   - fixed C style to adhere to current programming style
+   - added GBN implementation
+**********************************************************************/
+
+#define RTT  16.0       /* round trip time.  MUST BE SET TO 16.0 when submitting assignment */
+#define WINDOWSIZE 6    /* the maximum number of buffered unacked packet
+                          MUST BE SET TO 6 when submitting assignment */
+#define SEQSPACE 7      /* the min sequence space for GBN must be at least windowsize + 1 */
+#define NOTINUSE (-1)   /* used to fill header fields that are not being used */
+
+/* generic procedure to compute the checksum of a packet.  Used by both sender and receiver
+   the simulator will overwrite part of your packet with 'z's.  It will not overwrite your
+   original checksum.  This procedure must generate a different checksum to the original if
+   the packet is corrupted.
+*/
+int ComputeChecksum(struct pkt packet)
+{
+  int checksum = 0;
+  int i;
+
+  checksum = packet.seqnum;
+  checksum += packet.acknum;
+  for ( i=0; i<20; i++ )
+    checksum += (int)(packet.payload[i]);
+
+  return checksum;
+}
+
+bool IsCorrupted(struct pkt packet)
+{
+  if (packet.checksum == ComputeChecksum(packet))
+    return (false);
+  else
+    return (true);
+}
+
+
+/********* Sender (A) variables and functions ************/
+
+static struct pkt buffer[WINDOWSIZE];  /* array for storing packets waiting for ACK */
+static int windowfirst, windowlast;    /* array indexes of the first/last packet awaiting ACK */
+static int windowcount;                /* the number of packets currently awaiting an ACK */
+static int A_nextseqnum;               /* the next sequence number to be used by the sender */
+
+/* called from layer 5 (application layer), passed the message to be sent to other side */
+void A_output(struct msg message)
+{
+  struct pkt sendpkt;
+  int i;
+
+  /* if not blocked waiting on ACK */
+  if ( windowcount < WINDOWSIZE) {
+    if (TRACE > 1)
+      printf("----A: New message arrives, send window is not full, send new messge to layer3!\n");
+
+    /* create packet */
+    sendpkt.seqnum = A_nextseqnum;
+    sendpkt.acknum = NOTINUSE;
+    for ( i=0; i<20 ; i++ )
+      sendpkt.payload[i] = message.data[i];
+    sendpkt.checksum = ComputeChecksum(sendpkt);
+
+    /* put packet in window buffer */
+    /* windowlast will always be 0 for alternating bit; but not for GoBackN */
+    windowlast = (windowlast + 1) % WINDOWSIZE;
+    buffer[windowlast] = sendpkt;
+    windowcount++;
+
+    /* send out packet */
+    if (TRACE > 0)
+      printf("Sending packet %d to layer 3\n", sendpkt.seqnum);
+    tolayer3 (A, sendpkt);
+
+    /* start timer if first packet in window */
+    if (windowcount == 1)
+      starttimer(A,RTT);
+
+    /* get next sequence number, wrap back to 0 */
+    A_nextseqnum = (A_nextseqnum + 1) % SEQSPACE;
+  }
+  /* if blocked,  window is full */
+  else {
+    if (TRACE > 0)
+      printf("----A: New message arrives, send window is full\n");
+    window_full++;
+  }
+}
+
+
+/* called from layer 3, when a packet arrives for layer 4
+   In this practical this will always be an ACK as B never sends data.
+*/
+void A_input(struct pkt packet)
+{
+  int ackcount = 0;
+  int i;
+
+  /* if received ACK is not corrupted */
+  if (!IsCorrupted(packet)) {
+    if (TRACE > 0)
+      printf("----A: uncorrupted ACK %d is received\n",packet.acknum);
+    total_ACKs_received++;
+
+    /* check if new ACK or duplicate */
+    if (windowcount != 0) {
+          int seqfirst = buffer[windowfirst].seqnum;
+          int seqlast = buffer[windowlast].seqnum;
+          /* check case when seqnum has and hasn't wrapped */
+          if (((seqfirst <= seqlast) && (packet.acknum >= seqfirst && packet.acknum <= seqlast)) ||
+              ((seqfirst > seqlast) && (packet.acknum >= seqfirst || packet.acknum <= seqlast))) {
+
+            /* packet is a new ACK */
+            if (TRACE > 0)
+              printf("----A: ACK %d is not a duplicate\n",packet.acknum);
+            new_ACKs++;
+
+            /* cumulative acknowledgement - determine how many packets are ACKed */
+            if (packet.acknum >= seqfirst)
+              ackcount = packet.acknum + 1 - seqfirst;
+            else
+              ackcount = SEQSPACE - seqfirst + packet.acknum;
+
+	    /* slide window by the number of packets ACKed */
+            windowfirst = (windowfirst + ackcount) % WINDOWSIZE;
+
+            /* delete the acked packets from window buffer */
+            for (i=0; i<ackcount; i++)
+              windowcount--;
+
+	    /* start timer again if there are still more unacked packets in window */
+            stoptimer(A);
+            if (windowcount > 0)
+              starttimer(A, RTT);
+
+          }
         }
-    }
-    return (unsigned short)(~sum);
+        else
+          if (TRACE > 0)
+        printf ("----A: duplicate ACK received, do nothing!\n");
+  }
+  else
+    if (TRACE > 0)
+      printf ("----A: corrupted ACK is received, do nothing!\n");
 }
 
-/* 判断 pkt 是否损坏 */
-bool IsCorrupted(packet *pkt) {
-    return ComputeChecksum(pkt) != pkt->checksum;
-}
-/* A 端状态变量 */
-static int base, nextseqnum;
-static packet sender_buffer[WINDOWSIZE];
-static double timer[WINDOWSIZE];
+/* called when A's timer goes off */
+void A_timerinterrupt(void)
+{
+  int i;
 
-/* 初始化 A */
-void A_init(void) {
-    base = nextseqnum = 0;
-    for (int i = 0; i < WINDOWSIZE; i++) {
-        timer[i] = NOTINUSE;
-    }
-}
+  if (TRACE > 0)
+    printf("----A: time out,resend packets!\n");
 
-/* 应用层调用，发送新消息 */
-void A_output(message msg) {
-    packet pkt;
-    pkt.seqnum  = nextseqnum;
-    pkt.acknum  = NOTINUSE;
-    memcpy(pkt.payload, msg.data, sizeof(msg.data));
-    pkt.checksum = ComputeChecksum(&pkt);
+  for(i=0; i<windowcount; i++) {
 
-    sender_buffer[nextseqnum % WINDOWSIZE] = pkt;
-    if (nextseqnum < base + WINDOWSIZE) {
-        tolayer3(AEntity, pkt);
-        timer[nextseqnum % WINDOWSIZE] = RTT;
-    }
-    nextseqnum++;
+    if (TRACE > 0)
+      printf ("---A: resending packet %d\n", (buffer[(windowfirst+i) % WINDOWSIZE]).seqnum);
+
+    tolayer3(A,buffer[(windowfirst+i) % WINDOWSIZE]);
+    packets_resent++;
+    if (i==0) starttimer(A,RTT);
+  }
 }
 
-/* 接收到 ACK */
-void A_input(packet rcvd) {
-    if (!IsCorrupted(&rcvd) &&
-        rcvd.acknum >= base && rcvd.acknum < nextseqnum) {
-        int shift = rcvd.acknum - base + 1;
-        for (int i = 0; i < shift; i++) {
-            timer[(base + i) % WINDOWSIZE] = NOTINUSE;
-        }
-        base = rcvd.acknum + 1;
-    }
+
+
+/* the following routine will be called once (only) before any other */
+/* entity A routines are called. You can use it to do any initialization */
+void A_init(void)
+{
+  /* initialise A's window, buffer and sequence number */
+  A_nextseqnum = 0;  /* A starts with seq num 0, do not change this */
+  windowfirst = 0;
+  windowlast = -1;   /* windowlast is where the last packet sent is stored.
+		     new packets are placed in winlast + 1
+		     so initially this is set to -1
+		   */
+  windowcount = 0;
 }
 
-/* 定时器中断：重发窗口内所有超时包 */
-void A_timerinterrupt(void) {
-    for (int i = base; i < nextseqnum; i++) {
-        if (timer[i % WINDOWSIZE] == 0) {
-            tolayer3(AEntity, sender_buffer[i % WINDOWSIZE]);
-            timer[i % WINDOWSIZE] = RTT;
-        }
-    }
-}
-/* B 端状态变量 */
-static int expectedseqnum;
-static bool receive_ack[WINDOWSIZE];
-static packet receive_buffer[WINDOWSIZE];
 
-/* 初始化 B */
-void B_init(void) {
-    expectedseqnum = 0;
-    for (int i = 0; i < WINDOWSIZE; i++) {
-        receive_ack[i] = false;
-    }
-}
 
-/* 接收到数据包 */
-void B_input(packet rcvd) {
-    if (!IsCorrupted(&rcvd)) {
-        int pos = (rcvd.seqnum - expectedseqnum + SEQSPACE) % SEQSPACE;
-        if (pos < WINDOWSIZE && !receive_ack[pos]) {
-            /* 缓存包 */
-            receive_ack[pos]    = true;
-            receive_buffer[pos] = rcvd;
-        }
-        /* 按序交付 */
-        while (receive_ack[0]) {
-            tolayer5(BEntity, receive_buffer[0].payload);
-            for (int i = 0; i < WINDOWSIZE - 1; i++) {
-                receive_buffer[i] = receive_buffer[i+1];
-                receive_ack[i]    = receive_ack[i+1];
-            }
-            receive_ack[WINDOWSIZE-1] = false;
-            expectedseqnum = (expectedseqnum + 1) % SEQSPACE;
-        }
-    }
-    /* 发送 ACK */
-    packet ackpkt;
-    ackpkt.seqnum  = NOTINUSE;
-    ackpkt.acknum  = (expectedseqnum - 1 + SEQSPACE) % SEQSPACE;
-    ackpkt.checksum = ComputeChecksum(&ackpkt);
-    tolayer3(BEntity, ackpkt);
-}
+/********* Receiver (B)  variables and procedures ************/
 
-/* 简单保留空壳，备用 */
-void B_timerinterrupt(void)    {}
-void B_output(message msg)     {}
-/**************************************************************************
- * Go-Back-N Protocol Implementation
- * 
- * RTT:        16.0
- * WINDOWSIZE: 6
- * SEQSPACE:   12
- **************************************************************************/
+static int expectedseqnum; /* the sequence number expected next by the receiver */
+static int B_nextseqnum;   /* the sequence number for the next packets sent by B */
 
-#include "emulator.h"
-#include "gbn.h"
 
-#define RTT        16.0
-#define WINDOWSIZE 6
-#define SEQSPACE   12
-#define NOTINUSE   (-1)
+/* called from layer 3, when a packet arrives for layer 4 at B*/
+void B_input(struct pkt packet)
+{
+  struct pkt sendpkt;
+  int i;
 
-/* ===================== 校验和工具 ===================== */
-/* 计算并返回 pkt 的校验和 */
-unsigned short ComputeChecksum(packet *pkt) {
-    unsigned long sum = 0;
-    unsigned short *data = (unsigned short *)pkt;
-    for (int i = 0; i < sizeof(packet)/2; i++) {
-        sum += data[i];
-        if (sum & 0xFFFF0000) {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
-    }
-    return (unsigned short)(~sum);
+  /* if not corrupted and received packet is in order */
+  if  ( (!IsCorrupted(packet))  && (packet.seqnum == expectedseqnum) ) {
+    if (TRACE > 0)
+      printf("----B: packet %d is correctly received, send ACK!\n",packet.seqnum);
+    packets_received++;
+
+    /* deliver to receiving application */
+    tolayer5(B, packet.payload);
+
+    /* send an ACK for the received packet */
+    sendpkt.acknum = expectedseqnum;
+
+    /* update state variables */
+    expectedseqnum = (expectedseqnum + 1) % SEQSPACE;
+  }
+  else {
+    /* packet is corrupted or out of order resend last ACK */
+    if (TRACE > 0)
+      printf("----B: packet corrupted or not expected sequence number, resend ACK!\n");
+    if (expectedseqnum == 0)
+      sendpkt.acknum = SEQSPACE - 1;
+    else
+      sendpkt.acknum = expectedseqnum - 1;
+  }
+
+  /* create packet */
+  sendpkt.seqnum = B_nextseqnum;
+  B_nextseqnum = (B_nextseqnum + 1) % 2;
+
+  /* we don't have any data to send.  fill payload with 0's */
+  for ( i=0; i<20 ; i++ )
+    sendpkt.payload[i] = '0';
+
+  /* computer checksum */
+  sendpkt.checksum = ComputeChecksum(sendpkt);
+
+  /* send out packet */
+  tolayer3 (B, sendpkt);
 }
 
-/* 判断 pkt 是否损坏 */
-bool IsCorrupted(packet *pkt) {
-    return ComputeChecksum(pkt) != pkt->checksum;
+/* the following routine will be called once (only) before any other */
+/* entity B routines are called. You can use it to do any initialization */
+void B_init(void)
+{
+  expectedseqnum = 0;
+  B_nextseqnum = 1;
 }
 
-/* ===================== A 端逻辑 ===================== */
-static int    base, nextseqnum;
-static double timer[WINDOWSIZE];
-static packet sender_buffer[WINDOWSIZE];
+/******************************************************************************
+ * The following functions need be completed only for bi-directional messages *
+ *****************************************************************************/
 
-/* 初始化 A */
-void A_init(void) {
-    base = nextseqnum = 0;
-    for (int i = 0; i < WINDOWSIZE; i++) {
-        timer[i] = NOTINUSE;
-    }
+/* Note that with simplex transfer from a-to-B, there is no B_output() */
+void B_output(struct msg message)
+{
 }
 
-/* 应用层调用，发送新消息 */
-void A_output(message msg) {
-    packet pkt;
-    pkt.seqnum   = nextseqnum;
-    pkt.acknum   = NOTINUSE;
-    memcpy(pkt.payload, msg.data, sizeof(msg.data));
-    pkt.checksum = ComputeChecksum(&pkt);
-
-    sender_buffer[nextseqnum % WINDOWSIZE] = pkt;
-    if (nextseqnum < base + WINDOWSIZE) {
-        tolayer3(AEntity, pkt);
-        timer[nextseqnum % WINDOWSIZE] = RTT;
-    }
-    nextseqnum++;
+/* called when B's timer goes off */
+void B_timerinterrupt(void)
+{
 }
-
-/* 接收 ACK */
-void A_input(packet rcvd) {
-    if (!IsCorrupted(&rcvd) &&
-        rcvd.acknum >= base && rcvd.acknum < nextseqnum) {
-        int shift = rcvd.acknum - base + 1;
-        for (int i = 0; i < shift; i++) {
-            timer[(base + i) % WINDOWSIZE] = NOTINUSE;
-        }
-        base = rcvd.acknum + 1;
-    }
-}
-
-/* 定时器中断：重发超时包 */
-void A_timerinterrupt(void) {
-    for (int i = base; i < nextseqnum; i++) {
-        if (timer[i % WINDOWSIZE] == 0) {
-            tolayer3(AEntity, sender_buffer[i % WINDOWSIZE]);
-            timer[i % WINDOWSIZE] = RTT;
-        }
-    }
-}
-
-/* ===================== B 端逻辑 ===================== */
-static int  expectedseqnum;
-static bool receive_ack[WINDOWSIZE];
-static packet receive_buffer[WINDOWSIZE];
-
-/* 初始化 B */
-void B_init(void) {
-    expectedseqnum = 0;
-    for (int i = 0; i < WINDOWSIZE; i++) {
-        receive_ack[i] = false;
-    }
-}
-
-/* 接收数据包并按序交付 */
-void B_input(packet rcvd) {
-    if (!IsCorrupted(&rcvd)) {
-        int pos = (rcvd.seqnum - expectedseqnum + SEQSPACE) % SEQSPACE;
-        if (pos < WINDOWSIZE && !receive_ack[pos]) {
-            receive_ack[pos]    = true;
-            receive_buffer[pos] = rcvd;
-        }
-        while (receive_ack[0]) {
-            tolayer5(BEntity, receive_buffer[0].payload);
-            for (int i = 0; i < WINDOWSIZE - 1; i++) {
-                receive_buffer[i] = receive_buffer[i + 1];
-                receive_ack[i]    = receive_ack[i + 1];
-            }
-            receive_ack[WINDOWSIZE-1] = false;
-            expectedseqnum = (expectedseqnum + 1) % SEQSPACE;
-        }
-    }
-    packet ackpkt;
-    ackpkt.seqnum   = NOTINUSE;
-    ackpkt.acknum   = (expectedseqnum - 1 + SEQSPACE) % SEQSPACE;
-    ackpkt.checksum = ComputeChecksum(&ackpkt);
-    tolayer3(BEntity, ackpkt);
-}
-
-/* 保留空壳以备扩展 */
-void B_timerinterrupt(void) {}
-void B_output(message msg)    {}
